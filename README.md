@@ -2,6 +2,8 @@
 
 **Polymarket 交易链路自愈守护系统** —— 保证你的 Polymarket 交易系统 24 小时网络不断线，节点故障自动切换、自动告警。
 
+> **支持平台**：Linux（systemd）✅ / macOS（LaunchAgents）✅ —— guard.py 为跨平台版本，自动适配两套机制。
+
 ## 为什么需要它
 
 免费代理节点的本质是**不稳定**：存活率 <5%、活节点 20-60 分钟就死、Telegram 频道日抛节点泛滥。如果交易系统直接依赖单条代理链路，会出现：
@@ -49,7 +51,7 @@ proxy-guard 解决的就是这个问题——**把"断网发现+自愈+告警"�
 ### 一键安装
 
 ```bash
-git clone https://github.com/jugerword/proxy-guard.git
+git clone https://github.com/<你的用户名>/proxy-guard.git
 cd proxy-guard
 bash install.sh
 ```
@@ -61,7 +63,7 @@ bash install.sh
 4. 安装 mihomo 配置（`~/.config/mihomo/config.yaml`，原配置自动备份）
 5. 安装 systemd 定时器（**每分钟自动巡检**，开机 30 秒后首跑）
 
-### 手动部署
+### 手动部署（不想用脚本）
 
 ```bash
 # 1. 复制脚本
@@ -87,6 +89,71 @@ sudo sed -i "s|__DEPLOY_DIR__|$HOME/proxy-guard|g; s|__USER__|$USER|g" /etc/syst
 sudo systemctl daemon-reload
 sudo systemctl enable --now proxy-guard.timer
 ```
+
+## macOS 部署
+
+macOS 没有 systemd，改用 **LaunchAgents**（登录自动加载）+ guard.py 直接进程管理（mihomo 崩溃由 guard 拉起）。
+
+### 一键安装（macOS）
+
+```bash
+git clone https://github.com/<你的用户名>/proxy-guard.git
+cd proxy-guard
+bash install_macos.sh
+```
+
+脚本会：
+1. 检查环境（macOS / python3 / brew）
+2. 安装 mihomo（brew，ghcr 下载失败自动换清华镜像）
+3. 复制核心脚本到 `~/proxy-guard`
+4. 交互式配置 `.env`（Telegram 告警可跳过）
+5. 安装 mihomo 配置（`~/.config/mihomo/config.yaml`，原配置自动备份）
+6. 安装 LaunchAgents plist（**登录自动加载，每分钟巡检**）
+7. 启动 mihomo + 首轮巡检
+
+### 手动部署（macOS）
+
+```bash
+# 1. 安装 mihomo（ghcr 失败用清华镜像）
+brew install mihomo
+# 或: HOMEBREW_BOTTLE_DOMAIN=https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles brew install mihomo
+
+# 2. 复制脚本
+mkdir -p ~/proxy-guard && cp guard.py switch_node.py notify.py scan_nodes.py ~/proxy-guard/
+
+# 3. 配置 .env
+cat > ~/proxy-guard/.env << 'EOF'
+TELEGRAM_BOT_TOKEN=你的bot_token        # 可选
+TELEGRAM_CHAT_ID=你的chat_id            # 可选
+GUARD_GROUP=交易专用
+MIHOMO_BIN=/opt/homebrew/opt/mihomo/bin/mihomo
+MIHOMO_CONF_DIR=$HOME/.config/mihomo
+EOF
+chmod 600 ~/proxy-guard/.env
+
+# 4. 安装 mihomo 配置
+mkdir -p ~/.config/mihomo && cp config.yaml.example ~/.config/mihomo/config.yaml
+
+# 5. 安装 LaunchAgents（下次登录自动生效；当前会话可手动 bootstrap）
+mkdir -p ~/Library/LaunchAgents
+sed "s|__DEPLOY_DIR__|$HOME/proxy-guard|g; s|__USER__|$USER|g" \
+  macos/com.proxyguard.guard.plist > ~/Library/LaunchAgents/com.proxyguard.guard.plist
+
+# 6. 启动 mihomo + 首轮巡检
+nohup "$(command -v mihomo)" -d ~/.config/mihomo >> ~/proxy-guard/mihomo.run.log 2>&1 &
+sleep 30 && python3 ~/proxy-guard/guard.py
+
+# 7. 开启系统代理（浏览器上网必需）
+sudo networksetup -setwebproxy "Wi-Fi" 127.0.0.1 7890
+sudo networksetup -setsecurewebproxy "Wi-Fi" 127.0.0.1 7890
+sudo networksetup -setsocksfirewallproxy "Wi-Fi" 127.0.0.1 7890
+# 或: 系统设置 → 网络 → Wi-Fi → 详细信息 → 代理 → 手动（HTTP/HTTPS/SOCKS 均 127.0.0.1:7890）
+```
+
+> macOS 注意事项：
+> - guard.py 检测 mihomo 未运行时会自动拉起（LaunchAgents 每分钟巡检兜底）
+> - 如果 launchctl 被系统权限限制无法手动 bootstrap，**重启/重新登录后 LaunchAgents 会自动加载**，无需手动
+> - 系统代理开启后：国内网站直连（GEOIP,CN,DIRECT），外网走节点；mihomo 崩溃时浏览器会短暂断网（最多 1 分钟），guard 自动恢复
 
 ## 配置说明
 
@@ -174,15 +241,15 @@ guard 每分钟把状态写入 `status.json`：
 ```json
 {
   "timestamp": "2026-09-30 08:11:43",
-  "health": "ok",
-  "action": "",
+  "health": "ok",                // ok / fail
+  "action": "",                  // 最近自愈动作
   "mihomo_alive": true,
   "port7890": true,
-  "exit_country": "FR",
+  "exit_country": "FR",          // 出口国家（IP API 限流时为空，不影响判定）
   "exit_ip": "51.15.248.62",
   "clob_ok": true,
   "clob_detail": "HTTP 200",
-  "gamma_ok": true,
+  "gamma_ok": true,              // 真实交易层
   "gamma_detail": "HTTP 200 (行情数据正常)",
   "binance_ok": true
 }
