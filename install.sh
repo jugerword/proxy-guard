@@ -32,11 +32,35 @@ fi
 echo "  ✓ python3: $(python3 --version)"
 echo "  ✓ systemd 可用"
 
-# ---------- 2. mihomo 检查 ----------
+# ---------- 2. mihomo 检查/安装 ----------
 echo ""
 echo "[2/6] mihomo 检查..."
+PKG_MIHOMO="$SCRIPT_DIR/mihomo"
 if command -v mihomo >/dev/null 2>&1 || pgrep -f mihomo >/dev/null 2>&1; then
   echo "  ✓ mihomo 已存在（进程运行中或命令可用）"
+elif [[ -x "$PKG_MIHOMO" ]]; then
+  echo "  发现 Release 包自带 mihomo，安装到 /usr/local/bin/mihomo ..."
+  sudo install -m 755 "$PKG_MIHOMO" /usr/local/bin/mihomo
+  if [[ ! -f /etc/systemd/system/mihomo.service ]]; then
+    sudo tee /etc/systemd/system/mihomo.service >/dev/null << EOF
+[Unit]
+Description=mihomo (Clash Meta)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$USER
+ExecStart=/usr/local/bin/mihomo -d $HOME/.config/mihomo
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now mihomo
+    echo "  ✓ mihomo 已安装并创建 systemd 服务"
+  fi
 else
   echo "  ! mihomo 未安装。需要先安装 mihomo（Clash Meta）："
   echo "    下载: https://github.com/MetaCubeX/mihomo/releases"

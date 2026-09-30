@@ -35,8 +35,15 @@ echo "  ✓ macOS $(sw_vers -productVersion) / $(uname -m)"
 # ---------- 2. 安装 mihomo ----------
 echo ""
 echo "[2/7] 检查 mihomo..."
+PKG_MIHOMO="$SCRIPT_DIR/mihomo"
 if command -v mihomo >/dev/null 2>&1; then
   echo "  ✓ mihomo 已安装: $(mihomo -v | head -1)"
+elif [[ -x "$PKG_MIHOMO" ]]; then
+  echo "  使用 Release 包自带 mihomo，复制到 $DEPLOY_DIR/bin/ ..."
+  mkdir -p "$DEPLOY_DIR/bin"
+  cp "$PKG_MIHOMO" "$DEPLOY_DIR/bin/mihomo"
+  chmod +x "$DEPLOY_DIR/bin/mihomo"
+  echo "  ✓ 包内 mihomo: $DEPLOY_DIR/bin/mihomo"
 else
   echo "  未安装 mihomo，尝试 brew 安装（若 ghcr.io 下载失败会自动换清华镜像）..."
   if ! command -v brew >/dev/null 2>&1; then
@@ -74,7 +81,11 @@ else
   echo "# 出口组名（与 mihomo config.yaml 的组名一致）" >> "$ENV_FILE"
   echo "GUARD_GROUP=交易专用" >> "$ENV_FILE"
   echo "# mihomo 内核路径与配置目录（默认值即可）" >> "$ENV_FILE"
-  echo "MIHOMO_BIN=/opt/homebrew/opt/mihomo/bin/mihomo" >> "$ENV_FILE"
+  if [[ -x "$DEPLOY_DIR/bin/mihomo" ]]; then
+    echo "MIHOMO_BIN=$DEPLOY_DIR/bin/mihomo" >> "$ENV_FILE"
+  else
+    echo "MIHOMO_BIN=/opt/homebrew/opt/mihomo/bin/mihomo" >> "$ENV_FILE"
+  fi
   echo "MIHOMO_CONF_DIR=$MIHOMO_CONF_DIR" >> "$ENV_FILE"
   chmod 600 "$ENV_FILE"
   echo "  ✓ 已生成 $ENV_FILE (权限 600)"
@@ -103,8 +114,12 @@ echo "  立即加载（可选，当前会话生效）: launchctl bootstrap gui/$
 # ---------- 7. 启动 mihomo + 首轮巡检 ----------
 echo ""
 echo "[7/7] 启动 mihomo 并首轮巡检..."
+MIHOMO_RUN="$DEPLOY_DIR/bin/mihomo"
+if [[ ! -x "$MIHOMO_RUN" ]]; then
+  MIHOMO_RUN="$(command -v mihomo)"
+fi
 if ! pgrep -f "mihomo -d" >/dev/null 2>&1; then
-  nohup "$(command -v mihomo)" -d "$MIHOMO_CONF_DIR" >> "$DEPLOY_DIR/mihomo.run.log" 2>&1 &
+  nohup "$MIHOMO_RUN" -d "$MIHOMO_CONF_DIR" >> "$DEPLOY_DIR/mihomo.run.log" 2>&1 &
   echo "  mihomo 已后台启动，等待拉取订阅 (30s)..."
   sleep 30
 fi
