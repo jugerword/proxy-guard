@@ -1,0 +1,71 @@
+port: 7890
+socks-port: 7891
+allow-lan: true
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:9090
+proxy-providers:
+  free1:
+    type: http
+    url: https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt
+    interval: 3600
+    health-check:
+      enable: true
+      url: https://clob.polymarket.com/
+      interval: 60
+  free2:
+    type: http
+    url: https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt
+    interval: 3600
+    health-check:
+      enable: true
+      url: https://clob.polymarket.com/
+      interval: 60
+  free3:
+    type: http
+    url: https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity
+    interval: 3600
+    health-check:
+      enable: true
+      url: https://clob.polymarket.com/
+      interval: 60
+  free4:
+    type: http
+    url: https://cdn.jsdelivr.net/gh/freefq/free@master/v2
+    interval: 3600
+    health-check:
+      enable: true
+      url: https://clob.polymarket.com/
+      interval: 60
+proxy-groups:
+- name: 交易专用
+  type: fallback
+  proxies:
+  - 自动选择
+  - DIRECT
+  use:
+  - free1
+  - free2
+  - free3
+  - free4
+  url: https://clob.polymarket.com/
+  interval: 60
+  tolerance: 2
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+    - 240.0.0.0/4
+    - 0.0.0.0/32
+- name: 自动选择
+  type: url-test
+  use:
+  - free1
+  - free2
+  - free3
+  - free4
+  url: https://clob.polymarket.com/
+  interval: 300
+rules:
+- GEOIP,CN,DIRECT
+- MATCH,交易专用

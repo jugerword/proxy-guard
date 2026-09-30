@@ -1,0 +1,10 @@
+[Unit]
+Description=Proxy Guard - Polymarket 链路自愈守护
+After=network.target mihomo.service
+
+[Service]
+Type=oneshot
+User=__USER__
+EnvironmentFile=__DEPLOY_DIR__/.env
+WorkingDirectory=__DEPLOY_DIR__
+ExecStart=/usr/bin/python3 __DEPLOY_DIR__/guard.py
