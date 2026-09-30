@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
 """
-notify.py - Telegram 告警发送（可复用版）
-配置（环境变量，未配置则静默跳过，不影响 guard 主流程）：
+notify.py - Telegram 告警发送（环境变量版）
+配置（环境变量，或由 guard.py 加载同目录 .env）：
   TELEGRAM_BOT_TOKEN   机器人 token（从 @BotFather 获取）
   TELEGRAM_CHAT_ID     接收告警的 chat_id（给 @userinfobot 发送任意消息获取）
   NOTIFY_PROXY         代理地址（默认 http://127.0.0.1:7890，Telegram API 在国内需走代理）
-
-用法：
-  python3 notify.py "告警内容"
 """
 import urllib.request, json, sys, os, ssl
+
+def load_env(path=None):
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
+    except Exception:
+        pass
+
+load_env()
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")

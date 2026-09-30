@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-proxy-guard.py - Polymarket 交易链路守护（可复用版 v5）
+proxy-guard v6 - Polymarket 交易链路守护（跨平台：Linux / macOS）
 
 核心原则：节点名不可信，一切以【实测】为准（gamma-api 真实交易层）。
 判定标准（health=ok 必须满足）：
@@ -15,25 +15,52 @@ proxy-guard.py - Polymarket 交易链路守护（可复用版 v5）
   第三层: 重启 mihomo -> 更新订阅 -> 再试一轮
   兜底:  全部失败 -> 维持现状 + Telegram 告警
 
-配置方式（优先级：环境变量 > 本文件默认值）：
+平台适配：
+  Linux  -> systemctl / ss
+  macOS  -> 直接进程管理（Popen）/ lsof（launchd 受限环境可用此路径）
+
+配置（环境变量，或同目录 .env 文件）：
   PROXY_GUARD_DIR      脚本/状态文件目录（默认脚本所在目录）
   MIHOMO_API           mihomo 外部控制器地址（默认 http://127.0.0.1:9090）
   PROXY                本地代理端口（默认 http://127.0.0.1:7890）
   GUARD_GROUP          mihomo 出口组名（默认 交易专用）
-  SUDO_PASSWORD        系统用户 sudo 密码（restart mihomo 需要；留空则用无密码 sudo）
+  SUDO_PASSWORD        系统用户 sudo 密码（Linux restart 需要；留空则用无密码 sudo）
+  MIHOMO_BIN           mihomo 可执行文件路径（macOS 默认 /opt/homebrew/opt/mihomo/bin/mihomo）
+  MIHOMO_CONF_DIR      mihomo 配置目录（macOS 默认 ~/.config/mihomo）
   MAX_SWITCH           每轮最多切换测试的节点数（默认 15）
 
 状态输出: <PROXY_GUARD_DIR>/status.json （可被看板 /api/proxy 读取）
 """
-import urllib.request, json, time, ssl, subprocess, os, sys
+import urllib.request, json, time, ssl, subprocess, os, sys, platform
 from urllib.parse import quote
 
-# ---------- 可配置项（环境变量优先） ----------
+IS_DARWIN = platform.system() == "Darwin"
+
 BASE_DIR = os.environ.get("PROXY_GUARD_DIR", os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_env():
+    """读取同目录 .env（不覆盖已有环境变量），Linux systemd / macOS launchd 均可配合"""
+    try:
+        with open(os.path.join(BASE_DIR, ".env")) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
+    except Exception:
+        pass
+
+
+load_env()
+
 MIHOMO_API = os.environ.get("MIHOMO_API", "http://127.0.0.1:9090")
 PROXY = os.environ.get("PROXY", "http://127.0.0.1:7890")
 GROUP_NAME = os.environ.get("GUARD_GROUP", "交易专用")
 SUDO_PASSWORD = os.environ.get("SUDO_PASSWORD", "")
+MIHOMO_BIN = os.environ.get("MIHOMO_BIN", "/opt/homebrew/opt/mihomo/bin/mihomo")
+MIHOMO_CONF_DIR = os.environ.get("MIHOMO_CONF_DIR", os.path.expanduser("~/.config/mihomo"))
 
 STATUS_FILE = os.path.join(BASE_DIR, "status.json")
 LOG_FILE = os.path.join(BASE_DIR, "guard.log")
@@ -53,7 +80,6 @@ ALLOWED = {"JP","SG","DE","GB","FR","NL","KR","TW","LT","LV","CA","AU","SE","CH"
 # BLOCKED：仅保留实测/官方明确禁止的区域（CN 实测 geoblock，US 官方禁止。HK 实测 gamma 200，放行）
 BLOCKED = {"CN","US","KP","IR","CU","SY","RU","MM","VE","CF"}
 
-# 节点名称区域优先级（仅影响手动切换排序；fallback 组以健康检查实测为准）
 NODE_PRIORITY = ["JP","SG","DE","GB","FR","NL","KR","TW","LT","LV","CA","AU","SE","CH"]
 
 
@@ -68,12 +94,17 @@ def log(msg):
     print(line)
 
 
+def _direct_opener():
+    """本地 API 直连 opener（绕过环境代理，避免被代理规则/沙箱代理劫持）"""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def api(method, path, body=None):
     req = urllib.request.Request(MIHOMO_API + path, method=method)
     req.add_header("Content-Type", "application/json")
     data = json.dumps(body).encode() if body else None
     try:
-        r = urllib.request.urlopen(req, data=data, timeout=5)
+        r = _direct_opener().open(req, data=data, timeout=5)
         return r.status, r.read().decode()
     except Exception as e:
         return None, str(e)
@@ -89,7 +120,6 @@ def get_opener():
 
 
 def probe(opener, url, timeout=12):
-    """返回 (ok, detail)"""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": FULL_UA})
         r = opener.open(req, timeout=timeout)
@@ -101,8 +131,9 @@ def probe(opener, url, timeout=12):
 
 
 GAMMA_URL = "https://gamma-api.polymarket.com/markets?limit=1"
+
+
 def probe_gamma(opener):
-    """实测 gamma-api（真实交易层）：200 + 非空 JSON 才算通"""
     try:
         req = urllib.request.Request(GAMMA_URL, headers={"User-Agent": FULL_UA})
         r = opener.open(req, timeout=15)
@@ -137,6 +168,62 @@ def check_exit(opener):
     return None, None
 
 
+def port_open(port):
+    """检测端口监听：macOS 用 lsof，Linux 用 ss"""
+    if IS_DARWIN:
+        try:
+            out = subprocess.run(["lsof", "-nP", "-iTCP:%d" % port, "-sTCP:LISTEN"],
+                                 capture_output=True, text=True).stdout
+            return "LISTEN" in out
+        except Exception:
+            return False
+    else:
+        try:
+            out = subprocess.run(["ss", "-tln"], capture_output=True, text=True).stdout
+            return ":%d " % port in out
+        except Exception:
+            return False
+
+
+def _kill_mihomo():
+    """精确结束 mihomo 进程（按 -d 参数匹配）"""
+    try:
+        out = subprocess.run(["pgrep", "-f", "mihomo -d"], capture_output=True, text=True).stdout
+        for pid in out.split():
+            subprocess.run(["kill", pid], capture_output=True)
+    except Exception:
+        pass
+
+
+def _start_mihomo():
+    """macOS 直接后台启动 mihomo（launchd 在受限环境可能不可用）"""
+    try:
+        logf = open(os.path.join(BASE_DIR, "mihomo.run.log"), "ab")
+        subprocess.Popen(
+            [MIHOMO_BIN, "-d", MIHOMO_CONF_DIR],
+            stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception as e:
+        log(f"启动 mihomo 失败: {e}")
+
+
+def mihomo_ctl(action):
+    """启动/重启 mihomo：macOS 直接进程管理，Linux 用 systemctl"""
+    if IS_DARWIN:
+        if action in ("start", "restart"):
+            _kill_mihomo()
+            time.sleep(1)
+            _start_mihomo()
+            time.sleep(5)
+    else:
+        if SUDO_PASSWORD:
+            cmd = "echo %s | sudo -S systemctl %s mihomo" % (SUDO_PASSWORD, action)
+            subprocess.run(["bash", "-c", cmd], capture_output=True)
+        else:
+            subprocess.run(["systemctl", action, "mihomo"], capture_output=True)
+
+
 def check_mihomo():
     """返回 (mihomo_alive, port_alive)"""
     alive = False
@@ -145,18 +232,12 @@ def check_mihomo():
         alive = True
     except Exception:
         pass
-    port = False
-    try:
-        out = subprocess.run(["ss", "-tln"], capture_output=True, text=True).stdout
-        port = ":7890 " in out
-    except Exception:
-        pass
-    return alive, port
+    return alive, port_open(7890)
 
 
 def get_nodes():
     try:
-        d = json.loads(urllib.request.urlopen(MIHOMO_API + "/proxies", timeout=5).read())
+        d = json.loads(_direct_opener().open(MIHOMO_API + "/proxies", timeout=5).read())
         proxies = d.get("proxies", {})
         groups = {"Selector","URLTest","Fallback","Direct","Reject","Compatible","Pass","RejectDrop"}
         return [k for k, v in proxies.items() if v.get("type") not in groups]
@@ -177,9 +258,8 @@ def node_rank(name):
 
 
 def get_auto_current():
-    """获取 URLTest 组(自动选择)当前选中的节点，作为第一候选"""
     try:
-        d = json.loads(urllib.request.urlopen(MIHOMO_API + "/proxies", timeout=5).read())
+        d = json.loads(_direct_opener().open(MIHOMO_API + "/proxies", timeout=5).read())
         for name, p in d.get("proxies", {}).items():
             if p.get("type") == "URLTest" and p.get("now"):
                 return p["now"]
@@ -191,13 +271,11 @@ def get_auto_current():
 def ranked_nodes():
     nodes = get_nodes()
     auto = get_auto_current()
-    # known-good 缓存（最近成功过的）优先
     try:
         kg = json.load(open(KNOWN_GOOD_FILE))
         kg_names = [x["node"] for x in kg]
     except Exception:
         kg_names = []
-    # 排序：known-good > URLTest当前 > 区域优先级 > 其余
     ranked = sorted(nodes, key=lambda n: (
         0 if n in kg_names else 1,
         0 if n == auto else 1,
@@ -207,17 +285,14 @@ def ranked_nodes():
 
 
 def full_test():
-    """完整链路测试：gamma-api 通 = 交易可用 = health ok。
-    区域查询为辅助（IP API 可能限流，gamma 已证明交易层真实可达）。"""
+    """完整链路测试：gamma-api 通 = 交易可用 = health ok"""
     opener = get_opener()
     okg, detg = probe_gamma(opener)
     if not okg:
-        # gamma 不通：尽力查出口，若是 BLOCKED 区域则明确拒绝
         cc, ip = check_exit(opener)
         if cc in BLOCKED:
             return False, f"gamma不通且出口被封锁区域: {cc} ({ip})"
         return False, f"gamma: {detg}"
-    # gamma 通 = 交易层可用；区域仅作日志展示
     cc, ip = check_exit(opener)
     if cc in BLOCKED:
         return False, f"gamma通但出口在封锁区域: {cc} ({ip})"
@@ -226,18 +301,14 @@ def full_test():
 
 def restart_mihomo():
     log("重启 mihomo...")
-    if SUDO_PASSWORD:
-        cmd = f"echo {SUDO_PASSWORD} | sudo -S systemctl restart mihomo"
-    else:
-        cmd = "sudo -n systemctl restart mihomo"
-    subprocess.run(["bash", "-c", cmd], capture_output=True)
+    mihomo_ctl("restart")
     time.sleep(8)
 
 
 def update_sub():
     log("更新订阅源(触发 mihomo provider 刷新)...")
     try:
-        d = json.loads(urllib.request.urlopen(MIHOMO_API + "/providers/proxies", timeout=5).read())
+        d = json.loads(_direct_opener().open(MIHOMO_API + "/providers/proxies", timeout=5).read())
         for name in d.get("providers", {}):
             try:
                 api("PUT", "/providers/proxies/" + quote(name, safe=""))
@@ -249,11 +320,10 @@ def update_sub():
 
 
 def main():
-    # 1. mihomo 进程/端口
     m_alive, p_alive = check_mihomo()
     if not m_alive:
         log("mihomo 未运行，尝试启动")
-        subprocess.run(["systemctl", "start", "mihomo"], capture_output=True)
+        mihomo_ctl("start")
         time.sleep(5)
         m_alive, p_alive = check_mihomo()
     if m_alive and not p_alive:
@@ -261,7 +331,6 @@ def main():
         restart_mihomo()
         m_alive, p_alive = check_mihomo()
 
-    # 2. 完整链路测试
     ok, detail = full_test() if p_alive else (False, "7890端口不可用")
 
     action = ""
@@ -272,7 +341,6 @@ def main():
         health = "fail"
         log(f"链路异常: {detail}")
 
-        # 限频：120 秒内最多触发一轮修复
         now = time.time()
         can = True
         try:
@@ -282,7 +350,6 @@ def main():
             can = True
 
         if can:
-            # 第一层修复：刷新订阅源，让 fallback 组自动重选（mihomo 内建自愈）
             action = "刷新订阅+fallback自选"
             log("第一层修复：刷新订阅源，等待 fallback 自动重选...")
             update_sub()
@@ -295,7 +362,7 @@ def main():
                 log(f"刷新后仍不通({detail})，进入手动切换兜底")
                 action = "自动切换节点"
                 found = False
-                for attempt in range(2):  # 最多两轮：正常切换 -> 重启后重试
+                for attempt in range(2):
                     if attempt == 1:
                         log("第一轮失败，重启 mihomo + 更新订阅后重试")
                         restart_mihomo()
@@ -338,14 +405,10 @@ def main():
             action = f"{SWITCH_LIMIT_SEC}秒内已切换过，本轮跳过"
             log(action)
 
-    # 3. 当前出口信息（供看板）
     opener = get_opener()
     cc_now, ip_now = check_exit(opener)
-    # clob 状态
     okc, detc = probe(opener, "https://clob.polymarket.com/")
-    # gamma 状态（真实交易层）
     okg, detg = probe_gamma(opener)
-    # binance
     okb, detb = probe(opener, "https://api.binance.com/api/v3/ping", timeout=8)
 
     state = {
@@ -366,7 +429,6 @@ def main():
         json.dump(state, f, ensure_ascii=False, indent=2)
     log(f"状态写入: health={health} exit={cc_now}({ip_now}) clob={detc} binance={detb} action={action}")
 
-    # ---- Telegram 告警：仅在状态变化时通知 ----
     try:
         with open(LAST_STATE_FILE) as f:
             last_state = f.read().strip()
@@ -385,8 +447,7 @@ def main():
 
     if notify_reason:
         try:
-            _sp = subprocess
-            _sp.run(["python3", NOTIFY_SCRIPT, notify_reason], timeout=25, capture_output=True)
+            subprocess.run(["python3", NOTIFY_SCRIPT, notify_reason], timeout=25, capture_output=True)
             log(f"已发送 Telegram 告警: {notify_reason[:50]}...")
         except Exception as e:
             log(f"Telegram 告警发送失败: {e}")
