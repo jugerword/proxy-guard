@@ -1,0 +1,14 @@
+# 运行时状态（不提交）
+status.json
+guard.log
+known_good.json
+.last_state
+.switch_limit
+__pycache__/
+*.pyc
+
+# 本地配置（含敏感信息）
+.env
+
+# 系统文件
+.DS_Store
