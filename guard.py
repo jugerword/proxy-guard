@@ -17,7 +17,7 @@ proxy-guard v6 - Polymarket 交易链路守护（跨平台：Linux / macOS）
 
 平台适配：
   Linux  -> systemctl / ss
-  macOS  -> 直接进程管理（Popen）/ lsof（launchd 受限环境可用此路径）
+  macOS  -> launchd (kickstart -k) / lsof
 
 配置（环境变量，或同目录 .env 文件）：
   PROXY_GUARD_DIR      脚本/状态文件目录（默认脚本所在目录）
@@ -25,8 +25,8 @@ proxy-guard v6 - Polymarket 交易链路守护（跨平台：Linux / macOS）
   PROXY                本地代理端口（默认 http://127.0.0.1:7890）
   GUARD_GROUP          mihomo 出口组名（默认 交易专用）
   SUDO_PASSWORD        系统用户 sudo 密码（Linux restart 需要；留空则用无密码 sudo）
-  MIHOMO_BIN           mihomo 可执行文件路径（macOS 默认 /opt/homebrew/opt/mihomo/bin/mihomo）
-  MIHOMO_CONF_DIR      mihomo 配置目录（macOS 默认 ~/.config/mihomo）
+  MIHOMO_LABEL         macOS launchd 服务标签（默认 com.proxyguard.mihomo）
+  MIHOMO_PLIST         macOS launchd plist 路径（默认 ~/Library/LaunchAgents/com.proxyguard.mihomo.plist）
   MAX_SWITCH           每轮最多切换测试的节点数（默认 15）
 
 状态输出: <PROXY_GUARD_DIR>/status.json （可被看板 /api/proxy 读取）
@@ -67,9 +67,10 @@ LOG_FILE = os.path.join(BASE_DIR, "guard.log")
 LIMIT_FILE = os.path.join(BASE_DIR, ".switch_limit")
 LAST_STATE_FILE = os.path.join(BASE_DIR, ".last_state")
 KNOWN_GOOD_FILE = os.path.join(BASE_DIR, "known_good.json")
+BLACKLIST_FILE = os.path.join(BASE_DIR, "blacklist.json")
 NOTIFY_SCRIPT = os.path.join(BASE_DIR, "notify.py")
 
-MAX_SWITCH = int(os.environ.get("MAX_SWITCH", "15"))
+MAX_SWITCH = int(os.environ.get("MAX_SWITCH", "30"))
 SWITCH_LIMIT_SEC = 120  # 限频：120 秒内最多触发一轮修复
 
 FULL_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -236,13 +237,27 @@ def check_mihomo():
 
 
 def get_nodes():
+    """v1.19 兼容：provider 节点不再展开到顶层 /proxies，需从 providers API 逐池拉取"""
+    nodes = []
     try:
-        d = json.loads(_direct_opener().open(MIHOMO_API + "/proxies", timeout=5).read())
-        proxies = d.get("proxies", {})
-        groups = {"Selector","URLTest","Fallback","Direct","Reject","Compatible","Pass","RejectDrop"}
-        return [k for k, v in proxies.items() if v.get("type") not in groups]
+        d = json.loads(_direct_opener().open(MIHOMO_API + "/providers/proxies", timeout=5).read())
+        for name in d.get("providers", {}):
+            if name in ("default",):
+                continue
+            try:
+                dd = json.loads(_direct_opener().open(
+                    MIHOMO_API + "/providers/proxies/" + quote(name, safe=""), timeout=5).read())
+                plist = dd.get("proxies", [])
+                for p in plist:
+                    if isinstance(p, dict) and p.get("name"):
+                        nodes.append(p["name"])
+                    elif isinstance(p, str):
+                        nodes.append(p)
+            except Exception:
+                continue
     except Exception:
-        return []
+        pass
+    return nodes
 
 
 def switch_to(node):
@@ -276,11 +291,18 @@ def ranked_nodes():
         kg_names = [x["node"] for x in kg]
     except Exception:
         kg_names = []
+    try:
+        bl = json.load(open(BLACKLIST_FILE))
+        bl_names = [x["node"] for x in bl]
+    except Exception:
+        bl_names = []
     ranked = sorted(nodes, key=lambda n: (
         0 if n in kg_names else 1,
         0 if n == auto else 1,
         node_rank(n)
     ))
+    # 黑名单节点排到最后（避免选中已被实测封锁出口的节点）
+    ranked = [n for n in ranked if n not in bl_names] + [n for n in ranked if n in bl_names]
     return auto, ranked
 
 
@@ -373,7 +395,7 @@ def main():
                         s, resp = switch_to(node)
                         if s != 204:
                             continue
-                        time.sleep(3)
+                        time.sleep(5)
                         ok2, det2 = full_test()
                         if ok2:
                             log(f"  切换成功 [{i+1}] {node} -> {det2}")
@@ -407,6 +429,54 @@ def main():
 
     opener = get_opener()
     cc_now, ip_now = check_exit(opener)
+    # 【v6.1 出口纠偏】fallback 自动选路可能选中封锁区节点(如 MM/CN/US)，
+    # 状态写入前强制拉回合法区域；mihomo 的 clob health-check 无法识别区域封锁，
+    # 必须由 guard 实测出口并强制切换。切换后 60s 内 fallback 若回弹，下一轮会再拉回。
+    if cc_now in BLOCKED:
+        log(f"出口在封锁区域 {cc_now}({ip_now})，强制切换合法节点...")
+        corrected = False
+        for attempt in range(2):
+            if attempt == 1:
+                log("纠偏第一轮失败，重启 mihomo + 刷新订阅后重试")
+                restart_mihomo()
+                update_sub()
+            _auto, nodes = ranked_nodes()
+            for node in nodes[:MAX_SWITCH]:
+                s, resp = switch_to(node)
+                if s != 204:
+                    continue
+                time.sleep(5)
+                cc2, ip2 = check_exit(opener)
+                if cc2 and cc2 not in BLOCKED:
+                    log(f"出口纠偏成功: {cc2}({ip2}) via {node}")
+                    cc_now, ip_now = cc2, ip2
+                    health = "ok"
+                    action = "出口纠偏"
+                    corrected = True
+                    try:
+                        kg = json.load(open(KNOWN_GOOD_FILE))
+                    except Exception:
+                        kg = []
+                    kg = [x for x in kg if x["node"] != node][:30]
+                    kg.insert(0, {"node": node, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "detail": f"{cc2}({ip2})"})
+                    json.dump(kg, open(KNOWN_GOOD_FILE, "w"), ensure_ascii=False, indent=2)
+                    break
+                elif cc2 in BLOCKED:
+                    # 该节点出口也在封锁区，记入黑名单避免下次再试
+                    try:
+                        bl = json.load(open(BLACKLIST_FILE))
+                    except Exception:
+                        bl = []
+                    if not any(x["node"] == node for x in bl):
+                        bl.insert(0, {"node": node, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "cc": cc2})
+                        json.dump(bl[:100], open(BLACKLIST_FILE, "w"), ensure_ascii=False, indent=2)
+                        log(f"黑名单记录封锁出口节点: {node} ({cc2})")
+            if corrected:
+                break
+        if not corrected:
+            health = "fail"
+            action = "出口纠偏失败"
+            log("出口纠偏失败：候选节点均无法脱离封锁区，维持现状")
     okc, detc = probe(opener, "https://clob.polymarket.com/")
     okg, detg = probe_gamma(opener)
     okb, detb = probe(opener, "https://api.binance.com/api/v3/ping", timeout=8)
