@@ -8,10 +8,11 @@ proxy-guard v6 - Polymarket 交易链路守护（跨平台：Linux / macOS）
   2. 通过代理实测 gamma-api.polymarket.com 返回 200 + 非空行情数据（真实交易层）
   3. Binance ping 通（行情源）
   4. 出口区域不在 BLOCKED 列表（CN 实测 geoblock / US 官方禁止）
+  5. v6.4: 敏感域名(google/github)任一通（链路未被 GFW 盯）
 
 自愈动作（四级递进）：
   第一层: 刷新订阅源 -> 让 mihomo fallback 组自动重选健康节点（内建秒级自愈）
-  第二层: 遍历候选节点池逐个切换（known-good 缓存优先），每个实测 gamma
+  第二层: 遍历候选节点池逐个切换（known-good 缓存优先），每个实测 gamma + 敏感域名
   第三层: 重启 mihomo -> 更新订阅 -> 再试一轮
   兜底:  全部失败 -> 维持现状 + Telegram 告警
 
@@ -60,7 +61,7 @@ PROXY = os.environ.get("PROXY", "http://127.0.0.1:7890")
 GROUP_NAME = os.environ.get("GUARD_GROUP", "交易专用")
 SUDO_PASSWORD = os.environ.get("SUDO_PASSWORD", "")
 MIHOMO_BIN = os.environ.get("MIHOMO_BIN", "/opt/homebrew/opt/mihomo/bin/mihomo")
-MIHOMO_CONF_DIR = os.environ.get("MIHOMO_CONF_DIR", os.path.expanduser("~/.config/mihomo"))
+MIHOMO_CONF_DIR = os.environ.get("MIHOMO_CONF_DIR", "/opt/homebrew/etc/mihomo")
 
 STATUS_FILE = os.path.join(BASE_DIR, "status.json")
 LOG_FILE = os.path.join(BASE_DIR, "guard.log")
@@ -189,7 +190,7 @@ def port_open(port):
 def _kill_mihomo():
     """精确结束 mihomo 进程（按 -d 参数匹配）"""
     try:
-        out = subprocess.run(["pgrep", "-f", "mihomo -d"], capture_output=True, text=True).stdout
+        out = subprocess.run(["pgrep", "-f", "mihomo -d /opt/homebrew/etc/mihomo"], capture_output=True, text=True).stdout
         for pid in out.split():
             subprocess.run(["kill", pid], capture_output=True)
     except Exception:
@@ -229,11 +230,60 @@ def check_mihomo():
     """返回 (mihomo_alive, port_alive)"""
     alive = False
     try:
-        subprocess.run(["pgrep", "-f", "mihomo"], check=True, capture_output=True)
+        subprocess.run(["pgrep", "-f", "mihomo -d /opt/homebrew/etc/mihomo"], check=True, capture_output=True)
         alive = True
     except Exception:
         pass
     return alive, port_open(7890)
+
+
+def ensure_system_proxy_darwin():
+    """macOS：检测系统代理是否指向 127.0.0.1:7890，未开启则自动开启并返回修复结果。
+
+    背景：mihomo 在跑但系统代理被关（如 Clash GUI 退出/重启重置），
+    浏览器/应用流量不走代理 → 表现为"VPN 明明在跑却上不了外网"。
+    Linux 不需要此逻辑（依赖进程环境变量/TUN），返回 skip。
+    """
+    if not IS_DARWIN:
+        return True, "skip(linux)"
+    try:
+        out = subprocess.run(["scutil", "--proxy"], capture_output=True, text=True, timeout=8).stdout
+        http_on = "HTTPEnable : 1" in out
+        https_on = "HTTPSEnable : 1" in out
+        http_ok = http_on and "HTTPPort : 7890" in out
+        https_ok = https_on and "HTTPSPort : 7890" in out
+        if http_ok and https_ok:
+            return True, "系统代理正常(7890)"
+        # 系统代理缺失/指向错误 → 找可用网络服务接口并开启
+        svcs = subprocess.run(["networksetup", "-listallnetworkservices"],
+                              capture_output=True, text=True, timeout=8).stdout
+        iface = None
+        for line in svcs.splitlines():
+            l = line.strip().lstrip("*").strip()
+            if not l:
+                continue
+            if l.lower() in ("wi-fi", "wifi"):
+                iface = l
+                break
+        if not iface:
+            # 无 Wi-Fi：取第一个普通接口（排除 Thunderbolt/DEMO/AX 等）
+            for line in svcs.splitlines():
+                l = line.strip().lstrip("*").strip()
+                if l and all(k not in l for k in ("Thunderbolt", "DEMO", "Boardband", "Bridge")):
+                    iface = l
+                    break
+        if not iface:
+            return False, "未找到可用网络服务接口"
+        subprocess.run(["networksetup", "-setwebproxy", iface, "127.0.0.1", "7890"],
+                       capture_output=True, timeout=10)
+        subprocess.run(["networksetup", "-setsecurewebproxy", iface, "127.0.0.1", "7890"],
+                       capture_output=True, timeout=10)
+        subprocess.run(["networksetup", "-setsocksfirewallproxy", iface, "127.0.0.1", "7890"],
+                       capture_output=True, timeout=10)
+        time.sleep(1)
+        return True, f"系统代理已开启({iface} -> 127.0.0.1:7890)"
+    except Exception as e:
+        return False, f"系统代理设置失败: {e}"
 
 
 def get_nodes():
@@ -306,8 +356,24 @@ def ranked_nodes():
     return auto, ranked
 
 
+SENSITIVE_URLS = [
+    "https://www.google.com",
+    "https://github.com",
+]
+
+def probe_sensitive(opener, timeout=10):
+    """敏感域名探测：任一通即视为链路未被盯（本次事件中美国节点 google/github 全被掐、gamma 却通）"""
+    for url in SENSITIVE_URLS:
+        ok, det = probe(opener, url, timeout=timeout)
+        if ok:
+            return True, f"{url.split('/')[2]}={det}"
+    return False, "; ".join(f"{u.split('/')[2]}={probe(opener, u, timeout=timeout)[1]}" for u in SENSITIVE_URLS)
+
+
 def full_test():
-    """完整链路测试：gamma-api 通 = 交易可用 = health ok"""
+    """完整链路测试 v6.4：gamma 通(交易可用) + 敏感域名任一通(链路未被 GFW 盯) = health ok。
+    此前只测 gamma，导致"美国节点 gamma 通但 google/github 全被掐"被误判健康。
+    """
     opener = get_opener()
     okg, detg = probe_gamma(opener)
     if not okg:
@@ -318,7 +384,10 @@ def full_test():
     cc, ip = check_exit(opener)
     if cc in BLOCKED:
         return False, f"gamma通但出口在封锁区域: {cc} ({ip})"
-    return True, f"{cc or '?'} ({ip or '?'}) gamma={detg}"
+    oks, dets = probe_sensitive(opener)
+    if not oks:
+        return False, f"敏感域名被掐({dets}) 出口={cc}({ip}) 链路可能被盯"
+    return True, f"{cc or '?'} ({ip or '?'}) gamma={detg} {dets}"
 
 
 def restart_mihomo():
@@ -352,6 +421,12 @@ def main():
         log("7890 端口未监听，重启 mihomo")
         restart_mihomo()
         m_alive, p_alive = check_mihomo()
+
+    # 【v6.3 系统代理自愈】macOS：检测系统代理是否指向 7890，未开启自动修复
+    # （浏览器/应用依赖系统代理走 mihomo；系统代理被关会表现为"VPN 在跑却上不了外网"）
+    if IS_DARWIN:
+        sp_ok, sp_det = ensure_system_proxy_darwin()
+        log(f"系统代理: {sp_det}" + ("(已修复)" if sp_ok and "已开启" in sp_det else ""))
 
     ok, detail = full_test() if p_alive else (False, "7890端口不可用")
 
@@ -410,6 +485,17 @@ def main():
                             break
                         else:
                             log(f"  切换失败 [{i+1}] {node}: {det2}")
+                            # v6.4: gamma 通但整体失败 => 敏感域名被掐（链路被盯），记黑名单防下轮回切
+                            okg2, _ = probe_gamma(opener)
+                            if okg2:
+                                try:
+                                    bl = json.load(open(BLACKLIST_FILE))
+                                except Exception:
+                                    bl = []
+                                if not any(x["node"] == node for x in bl):
+                                    bl.insert(0, {"node": node, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "reason": "敏感域名探测失败(链路被盯)"})
+                                    json.dump(bl[:100], open(BLACKLIST_FILE, "w"), ensure_ascii=False, indent=2)
+                                log(f"  [v6.4] {node} gamma通但敏感域名失败，已记黑名单")
                     if found:
                         break
                     if not found:
@@ -480,6 +566,7 @@ def main():
     okc, detc = probe(opener, "https://clob.polymarket.com/")
     okg, detg = probe_gamma(opener)
     okb, detb = probe(opener, "https://api.binance.com/api/v3/ping", timeout=8)
+    oks, dets = probe_sensitive(opener)
 
     state = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -494,6 +581,8 @@ def main():
         "gamma_ok": bool(okg),
         "gamma_detail": detg,
         "binance_ok": bool(okb),
+        "sensitive_ok": bool(oks),
+        "sensitive_detail": dets,
     }
     with open(STATUS_FILE, "w") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
@@ -509,9 +598,9 @@ def main():
     notify_reason = None
     if cur_state != last_state:
         if health == "fail":
-            notify_reason = f"⚠️ *Polymarket 网络链路故障！*\n出口: {cc_now}({ip_now})\nclob: {detc} gamma: {detg} binance: {detb}\n动作: {action}"
+            notify_reason = f"⚠️ *Polymarket 网络链路故障！*\n出口: {cc_now}({ip_now})\nclob: {detc} gamma: {detg} 敏感域名: {dets}\n动作: {action}"
         elif action and "切换" in action:
-            notify_reason = f"🔄 *Polymarket 节点已自动切换*\n出口: {cc_now}({ip_now}) health={health} clob: {detc}"
+            notify_reason = f"🔄 *Polymarket 节点已自动切换*\n出口: {cc_now}({ip_now}) health={health} 敏感域名: {dets}"
         elif health == "ok" and last_state and "ok" not in last_state:
             notify_reason = f"✅ *Polymarket 网络已恢复*\n出口: {cc_now}({ip_now}) clob: {detc}"
 
